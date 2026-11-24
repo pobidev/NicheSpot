@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db.js';
+import db, { resolveFavoriteAlbums } from '../db.js';
 import { authenticateToken } from '../middleware/auth.js';
 
 const router = Router();
@@ -56,14 +56,16 @@ router.get('/recommendations', (req, res) => {
   try {
     const userId = req.user.id;
     const recs = db.prepare(`
-      SELECT ua.id as user_album_id, ua.updated_at,
+      SELECT ua.id as user_album_id, ua.status, ua.updated_at,
              a.id as album_id, a.external_id, a.source, a.title, a.artist, a.year, a.cover_url,
              u.id as recommender_id, u.username as recommender_username, u.display_name as recommender_display_name,
              u.display_name as recommended_by
       FROM user_albums ua
       JOIN albums a ON a.id = ua.album_id
       JOIN users u ON u.id = ua.recommended_by_user_id
-      WHERE ua.user_id = ? AND ua.recommended_by_user_id IS NOT NULL AND ua.status = 'to_listen'
+      WHERE ua.user_id = ?
+        AND ua.recommended_by_user_id IS NOT NULL
+        AND COALESCE(ua.pending_recommendation, 0) = 1
       ORDER BY ua.updated_at DESC
     `).all(userId);
 
@@ -77,10 +79,22 @@ router.delete('/recommendations/:albumId', (req, res) => {
   try {
     const userId = req.user.id;
     const { albumId } = req.params;
-    db.prepare(`
-      UPDATE user_albums SET recommended_by_user_id = NULL
-      WHERE user_id = ? AND (album_id = ? OR id = ?)
+
+    // Si estaba pendiente (no añadida aún a ninguna lista), se elimina directamente
+    const del = db.prepare(`
+      DELETE FROM user_albums
+      WHERE user_id = ?
+        AND (album_id = ? OR id = ?)
+        AND COALESCE(pending_recommendation, 0) = 1
     `).run(userId, albumId, albumId);
+
+    if (del.changes === 0) {
+      db.prepare(`
+        UPDATE user_albums SET recommended_by_user_id = NULL
+        WHERE user_id = ? AND (album_id = ? OR id = ?)
+      `).run(userId, albumId, albumId);
+    }
+
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: 'Failed to dismiss recommendation' });
@@ -90,23 +104,33 @@ router.delete('/recommendations/:albumId', (req, res) => {
 router.post('/request', (req, res) => {
   try {
     const userId = req.user.id;
-    let { friend_id, username } = req.body;
+    let { friend_id, user_id, username } = req.body || {};
+    friend_id = friend_id || user_id;
 
     if (username && !friend_id) {
-      const user = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+      const user = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username.trim());
       if (!user) return res.status(404).json({ error: 'User not found' });
       friend_id = user.id;
     }
 
     if (!friend_id) return res.status(400).json({ error: 'friend_id or username is required' });
-    if (friend_id === userId) return res.status(400).json({ error: 'Cannot send friend request to yourself' });
+    if (Number(friend_id) === Number(userId)) {
+      return res.status(400).json({ error: 'Cannot send friend request to yourself' });
+    }
 
     const existing = db.prepare(`
-      SELECT id FROM friendships
+      SELECT id, user_id, status FROM friendships
       WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)
     `).get(userId, friend_id, friend_id, userId);
 
-    if (existing) return res.status(409).json({ error: 'Friendship already exists' });
+    if (existing) {
+      if (existing.status === 'pending' && Number(existing.user_id) === Number(friend_id)) {
+        db.prepare("UPDATE friendships SET status = 'accepted' WHERE id = ?").run(existing.id);
+        const accepted = db.prepare('SELECT * FROM friendships WHERE id = ?').get(existing.id);
+        return res.json(accepted);
+      }
+      return res.status(409).json({ error: 'Friendship already exists' });
+    }
 
     const result = db.prepare(
       'INSERT INTO friendships (user_id, friend_id) VALUES (?, ?)'
@@ -151,6 +175,31 @@ router.delete('/:id', (req, res) => {
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: 'Failed to delete friendship' });
+  }
+});
+
+router.get('/:id/favorites', (req, res) => {
+  try {
+    const currentUserId = Number(req.user.id);
+    const targetUserId = parseInt(req.params.id, 10);
+
+    if (currentUserId !== targetUserId) {
+      const friendship = db
+        .prepare(
+          `SELECT id FROM friendships
+           WHERE ((user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?))
+             AND status = 'accepted'`
+        )
+        .get(currentUserId, targetUserId, targetUserId, currentUserId);
+
+      if (!friendship) {
+        return res.status(403).json({ error: 'You must be friends to view their favorites' });
+      }
+    }
+
+    res.json(resolveFavoriteAlbums(targetUserId));
+  } catch {
+    res.status(500).json({ error: 'Failed to get friend favorites' });
   }
 });
 

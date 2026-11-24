@@ -26,7 +26,26 @@ export const login = (data) => api('/api/auth/login', { method: 'POST', body: JS
 export const register = (data) => api('/api/auth/register', { method: 'POST', body: JSON.stringify(data) });
 export const getMe = () => api('/api/auth/me');
 
-export const searchAlbums = (q) => api(`/api/albums/search?q=${encodeURIComponent(q)}`);
+export const searchAlbums = (q, { type = 'artist', page = 1, limit = 18 } = {}) => {
+  const params = new URLSearchParams({
+    q,
+    type,
+    page: String(page),
+    limit: String(limit),
+  });
+  return api(`/api/albums/search?${params.toString()}`);
+};
+
+export const getAlbumTracklist = ({ artist, title, external_id, source, sync_lastfm = true }) => {
+  const params = new URLSearchParams({
+    artist: artist || '',
+    title: title || '',
+    ...(external_id ? { external_id } : {}),
+    ...(source ? { source } : {}),
+    sync_lastfm: sync_lastfm ? '1' : '0',
+  });
+  return api(`/api/albums/tracklist?${params.toString()}`);
+};
 export const getFeed = () => api('/api/albums/feed');
 export const addAlbum = (data) => api('/api/albums', { method: 'POST', body: JSON.stringify(data) });
 
@@ -44,7 +63,9 @@ export const sendFriendRequest = (data) => api('/api/friends/request', { method:
 export const acceptFriend = (id) => api(`/api/friends/${id}/accept`, { method: 'PUT' });
 export const removeFriend = (id) => api(`/api/friends/${id}`, { method: 'DELETE' });
 export const searchUsers = (q = '') => api('/api/friends/search' + (q ? `?q=${encodeURIComponent(q)}` : ''));
+export const getFriendFavorites = (userId) => api(`/api/friends/${userId}/favorites`);
 
 export const getProfile = () => api('/api/profile');
 export const updateProfile = (data) => api('/api/profile', { method: 'PUT', body: JSON.stringify(data) });
+export const updateFavorites = (albumIds) => api('/api/profile/favorites', { method: 'PUT', body: JSON.stringify({ album_ids: albumIds }) });
 export const syncLastfm = () => api('/api/profile/sync-lastfm', { method: 'POST' });
