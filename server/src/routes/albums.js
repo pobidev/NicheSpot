@@ -1,6 +1,10 @@
 import { Router } from 'express';
-import db, { removeAlbumFromFavorites } from '../db.js';
+import db, {
+  removeAlbumFromFavorites,
+  createRecommendationNotification,
+} from '../db.js';
 import { authenticateToken } from '../middleware/auth.js';
+import { normalizeMusicText, normalizeTrackTitle } from './profile.js';
 
 const router = Router();
 router.use(authenticateToken);
@@ -100,9 +104,14 @@ function syncTracksForUserAlbum(userAlbumId, tracks) {
 
 function queryUserAlbums(targetUserId, { status, sort, q }) {
   let query = `
-    SELECT ua.id as user_album_id, ua.*, a.external_id, a.source, a.title, a.artist, a.year, a.cover_url
+    SELECT ua.id as user_album_id, ua.*,
+           a.external_id, a.source, a.title, a.artist, a.year, a.cover_url,
+           rec.display_name as recommended_by_name,
+           rec.username as recommended_by_username,
+           rec.display_name as recommended_by
     FROM user_albums ua
     JOIN albums a ON a.id = ua.album_id
+    LEFT JOIN users rec ON rec.id = ua.recommended_by_user_id
     WHERE ua.user_id = ?
       AND COALESCE(ua.pending_recommendation, 0) = 0
   `;
@@ -119,12 +128,13 @@ function queryUserAlbums(targetUserId, { status, sort, q }) {
       a.title LIKE ? OR
       a.artist LIKE ? OR
       COALESCE(ua.note, '') LIKE ? OR
+      COALESCE(rec.display_name, '') LIKE ? OR
       EXISTS (
         SELECT 1 FROM user_album_tracks uat
         WHERE uat.user_album_id = ua.id AND uat.track_title LIKE ?
       )
     )`;
-    params.push(term, term, term, term);
+    params.push(term, term, term, term, term);
   }
 
   query += ` ORDER BY ${getOrderByClause(sort)}`;
@@ -270,33 +280,50 @@ async function fetchAlbumTracklistFromProviders({ artist, title, external_id, so
   return tracks;
 }
 
-async function getUserScrobbledTracksForAlbum(lastfmUsername, artist, albumTitle) {
-  const apiKey = process.env.LASTFM_API_KEY;
-  if (!apiKey || !lastfmUsername || !artist || !albumTitle) return new Set();
-
+async function getUserScrobbledTracksForAlbum(userId, lastfmUsername, artist, albumTitle) {
   const listenedSet = new Set();
-  const normArtist = artist.trim().toLowerCase();
-  const normAlbum = albumTitle.trim().toLowerCase();
+  if (!artist || !albumTitle) return listenedSet;
+
+  const normArtist = normalizeMusicText(artist);
+  const normAlbum = normalizeMusicText(albumTitle);
+
+  // 1. Consultar primero todo el archivo histórico sincronizado en SQLite
+  try {
+    const storedRows = db
+      .prepare(
+        'SELECT track_norm, track_title FROM user_lastfm_tracks WHERE user_id = ? AND artist_norm = ? AND album_norm = ?'
+      )
+      .all(userId, normArtist, normAlbum);
+
+    for (const r of storedRows) {
+      if (r.track_norm) listenedSet.add(r.track_norm);
+      if (r.track_title) listenedSet.add(normalizeTrackTitle(r.track_title));
+    }
+  } catch {
+    // Continuar con consulta en vivo
+  }
+
+  // 2. Complementar con las 100 escuchas más recientes en vivo (por si aún no pulsó Sincronizar)
+  const apiKey = process.env.LASTFM_API_KEY;
+  if (!apiKey || !lastfmUsername) return listenedSet;
 
   try {
-    for (let page = 1; page <= 2; page++) {
-      const url = `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user=${encodeURIComponent(lastfmUsername)}&api_key=${encodeURIComponent(apiKey)}&format=json&limit=200&page=${page}`;
-      const res = await fetch(url);
-      if (!res.ok) break;
+    const url = `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user=${encodeURIComponent(
+      lastfmUsername
+    )}&api_key=${encodeURIComponent(apiKey)}&format=json&limit=100&page=1`;
+    const res = await fetch(url);
+    if (res.ok) {
       const data = await res.json().catch(() => null);
       let raw = data?.recenttracks?.track || [];
       if (!Array.isArray(raw)) raw = [raw];
-      if (raw.length === 0) break;
 
       for (const t of raw) {
-        const tArtist = (
+        const tArtist = normalizeMusicText(
           typeof t.artist === 'object' ? t.artist?.['#text'] || t.artist?.name : t.artist || ''
-        )
-          .trim()
-          .toLowerCase();
-        const tAlbum = (t.album?.['#text'] || '').trim().toLowerCase();
+        );
+        const tAlbum = normalizeMusicText(t.album?.['#text'] || '');
         if (tArtist === normArtist && tAlbum === normAlbum && t.name) {
-          listenedSet.add(t.name.trim().toLowerCase());
+          listenedSet.add(normalizeTrackTitle(t.name));
         }
       }
     }
@@ -556,15 +583,18 @@ router.get('/tracklist', async (req, res) => {
     let scrobbledSet = new Set();
     if (sync_lastfm === '1' || sync_lastfm === 'true') {
       const user = db.prepare('SELECT lastfm_username FROM users WHERE id = ?').get(req.user.id);
-      if (user?.lastfm_username) {
-        scrobbledSet = await getUserScrobbledTracksForAlbum(user.lastfm_username.trim(), artist, title);
-      }
+      scrobbledSet = await getUserScrobbledTracksForAlbum(
+        req.user.id,
+        user?.lastfm_username?.trim() || null,
+        artist,
+        title
+      );
     }
 
     const tracks = baseTracks.map((t) => ({
       track_number: t.track_number,
       track_title: t.track_title,
-      listened: scrobbledSet.has(t.track_title.toLowerCase()),
+      listened: scrobbledSet.has(normalizeTrackTitle(t.track_title)),
     }));
 
     res.json({
@@ -647,7 +677,7 @@ router.get('/feed', (req, res) => {
         `
       SELECT ua.id as user_album_id, ua.status, ua.rating, ua.note, ua.updated_at,
              a.id as album_id, a.external_id, a.source, a.title, a.artist, a.year, a.cover_url,
-             u.id as user_id, u.username, u.display_name
+             u.id as user_id, u.username, u.display_name, u.avatar_url
       FROM user_albums ua
       JOIN albums a ON a.id = ua.album_id
       JOIN users u ON u.id = ua.user_id
@@ -707,13 +737,13 @@ router.post('/user-albums', (req, res) => {
       return res.status(400).json({ error: 'Rating must be an integer between 1 and 10 or null' });
     }
 
-    const targetAlbum = db.prepare('SELECT id, title, artist FROM albums WHERE id = ?').get(album_id);
+    const targetAlbum = db.prepare('SELECT id, title, artist, cover_url FROM albums WHERE id = ?').get(album_id);
     if (!targetAlbum) return res.status(404).json({ error: 'Album not found' });
 
     const existing = db
       .prepare(
         `
-      SELECT ua.id
+      SELECT ua.id, ua.album_id, ua.status, ua.rating, ua.note, ua.recommended_by_user_id, ua.pending_recommendation
       FROM user_albums ua
       JOIN albums a ON a.id = ua.album_id
       WHERE ua.user_id = ? AND (
@@ -722,24 +752,44 @@ router.post('/user-albums', (req, res) => {
           LOWER(TRIM(a.artist)) = LOWER(TRIM(?))
         )
       )
+      LIMIT 1
     `
       )
       .get(userId, album_id, targetAlbum.title, targetAlbum.artist);
 
     let userAlbumId;
-    const cleanNote = note !== undefined && note !== '' ? note : null;
+    let effectiveAlbumId = album_id;
+    let recommenderIdToNotify = null;
 
     if (existing) {
+      // Conservar el album_id original para no romper referencias en favorite_albums
+      effectiveAlbumId = existing.album_id;
+      if (targetAlbum.cover_url) {
+        db.prepare('UPDATE albums SET cover_url = COALESCE(cover_url, ?) WHERE id = ?').run(
+          targetAlbum.cover_url,
+          effectiveAlbumId
+        );
+      }
+
+      const nextRating = rating !== undefined ? parsedRating : existing.rating;
+      const nextNote = note !== undefined ? (note === '' ? null : note) : existing.note;
+      const preservedRecommenderId = existing.recommended_by_user_id || null;
+
+      if (finalStatus === 'listened' && existing.status !== 'listened' && preservedRecommenderId) {
+        recommenderIdToNotify = preservedRecommenderId;
+      }
+
       db.prepare(
         `
         UPDATE user_albums SET
-          album_id = ?, status = ?, rating = ?, note = ?,
-          recommended_by_user_id = NULL, pending_recommendation = 0, updated_at = datetime('now')
+          status = ?, rating = ?, note = ?,
+          recommended_by_user_id = ?, pending_recommendation = 0, updated_at = datetime('now')
         WHERE id = ?
       `
-      ).run(album_id, finalStatus, parsedRating, cleanNote, existing.id);
+      ).run(finalStatus, nextRating, nextNote, preservedRecommenderId, existing.id);
       userAlbumId = existing.id;
     } else {
+      const cleanNote = note !== undefined && note !== '' ? note : null;
       const info = db
         .prepare(
           `
@@ -751,8 +801,19 @@ router.post('/user-albums', (req, res) => {
       userAlbumId = info.lastInsertRowid;
     }
 
+    if (recommenderIdToNotify) {
+      const finalRow = db.prepare('SELECT rating, note FROM user_albums WHERE id = ?').get(userAlbumId);
+      createRecommendationNotification({
+        recommenderId: recommenderIdToNotify,
+        listenerId: userId,
+        albumId: effectiveAlbumId,
+        rating: finalRow?.rating ?? null,
+        note: finalRow?.note ?? null,
+      });
+    }
+
     if (finalStatus !== 'listened') {
-      removeAlbumFromFavorites(userId, album_id);
+      removeAlbumFromFavorites(userId, effectiveAlbumId);
     }
 
     if (Array.isArray(tracks)) syncTracksForUserAlbum(userAlbumId, tracks);
@@ -788,15 +849,26 @@ router.put('/user-albums/:id', (req, res) => {
 
     const cleanNote = note !== undefined ? (note === '' ? null : note) : existing.note;
     const nextStatus = status || existing.status;
+    const preservedRecommenderId = existing.recommended_by_user_id || null;
 
     db.prepare(
       `
       UPDATE user_albums SET
         status = ?, rating = ?, note = ?,
-        recommended_by_user_id = NULL, pending_recommendation = 0, updated_at = datetime('now')
+        recommended_by_user_id = ?, pending_recommendation = 0, updated_at = datetime('now')
       WHERE id = ? AND user_id = ?
     `
-    ).run(nextStatus, parsedRating, cleanNote, id, userId);
+    ).run(nextStatus, parsedRating, cleanNote, preservedRecommenderId, id, userId);
+
+    if (nextStatus === 'listened' && existing.status !== 'listened' && preservedRecommenderId) {
+      createRecommendationNotification({
+        recommenderId: preservedRecommenderId,
+        listenerId: userId,
+        albumId: existing.album_id,
+        rating: parsedRating,
+        note: cleanNote,
+      });
+    }
 
     if (nextStatus !== 'listened') {
       removeAlbumFromFavorites(userId, existing.album_id);

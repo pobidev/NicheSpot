@@ -1,9 +1,21 @@
 import { Router } from 'express';
-import db, { resolveFavoriteAlbums } from '../db.js';
+import db, { resolveFavoriteAlbums, resolveFavoriteTracks } from '../db.js';
 import { authenticateToken } from '../middleware/auth.js';
 
 const router = Router();
 router.use(authenticateToken);
+
+function canViewFriendData(currentUserId, targetUserId) {
+  if (Number(currentUserId) === Number(targetUserId)) return true;
+  const friendship = db
+    .prepare(
+      `SELECT id FROM friendships
+       WHERE ((user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?))
+         AND status = 'accepted'`
+    )
+    .get(currentUserId, targetUserId, targetUserId, currentUserId);
+  return Boolean(friendship);
+}
 
 router.get('/', (req, res) => {
   try {
@@ -11,7 +23,7 @@ router.get('/', (req, res) => {
     const friends = db.prepare(`
       SELECT f.id,
         CASE WHEN f.user_id = ? THEN f.friend_id ELSE f.user_id END as friend_user_id,
-        u.username, u.display_name
+        u.username, u.display_name, u.avatar_url
       FROM friendships f
       JOIN users u ON u.id = CASE WHEN f.user_id = ? THEN f.friend_id ELSE f.user_id END
       WHERE (f.user_id = ? OR f.friend_id = ?) AND f.status = 'accepted'
@@ -22,7 +34,13 @@ router.get('/', (req, res) => {
       friendship_id: f.id,
       username: f.username,
       display_name: f.display_name,
-      user: { id: f.friend_user_id, username: f.username, display_name: f.display_name },
+      avatar_url: f.avatar_url || null,
+      user: {
+        id: f.friend_user_id,
+        username: f.username,
+        display_name: f.display_name,
+        avatar_url: f.avatar_url || null,
+      },
     })));
   } catch {
     res.status(500).json({ error: 'Failed to get friends' });
@@ -33,7 +51,7 @@ router.get('/pending', (req, res) => {
   try {
     const userId = req.user.id;
     const pending = db.prepare(`
-      SELECT f.id, f.created_at, u.id as user_id, u.username, u.display_name
+      SELECT f.id, f.created_at, u.id as user_id, u.username, u.display_name, u.avatar_url
       FROM friendships f
       JOIN users u ON u.id = f.user_id
       WHERE f.friend_id = ? AND f.status = 'pending'
@@ -45,7 +63,13 @@ router.get('/pending', (req, res) => {
       user_id: p.user_id,
       username: p.username,
       display_name: p.display_name,
-      user: { id: p.user_id, username: p.username, display_name: p.display_name },
+      avatar_url: p.avatar_url || null,
+      user: {
+        id: p.user_id,
+        username: p.username,
+        display_name: p.display_name,
+        avatar_url: p.avatar_url || null,
+      },
     })));
   } catch {
     res.status(500).json({ error: 'Failed to get pending requests' });
@@ -59,6 +83,7 @@ router.get('/recommendations', (req, res) => {
       SELECT ua.id as user_album_id, ua.status, ua.updated_at,
              a.id as album_id, a.external_id, a.source, a.title, a.artist, a.year, a.cover_url,
              u.id as recommender_id, u.username as recommender_username, u.display_name as recommender_display_name,
+             u.avatar_url as recommender_avatar_url,
              u.display_name as recommended_by
       FROM user_albums ua
       JOIN albums a ON a.id = ua.album_id
@@ -80,7 +105,6 @@ router.delete('/recommendations/:albumId', (req, res) => {
     const userId = req.user.id;
     const { albumId } = req.params;
 
-    // Si estaba pendiente (no añadida aún a ninguna lista), se elimina directamente
     const del = db.prepare(`
       DELETE FROM user_albums
       WHERE user_id = ?
@@ -90,7 +114,7 @@ router.delete('/recommendations/:albumId', (req, res) => {
 
     if (del.changes === 0) {
       db.prepare(`
-        UPDATE user_albums SET recommended_by_user_id = NULL
+        UPDATE user_albums SET recommended_by_user_id = NULL, pending_recommendation = 0
         WHERE user_id = ? AND (album_id = ? OR id = ?)
       `).run(userId, albumId, albumId);
     }
@@ -98,6 +122,69 @@ router.delete('/recommendations/:albumId', (req, res) => {
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: 'Failed to dismiss recommendation' });
+  }
+});
+
+router.get('/recommendation-notifications', (req, res) => {
+  try {
+    const userId = req.user.id;
+    const rows = db.prepare(`
+      SELECT rn.id, rn.rating, rn.note, rn.created_at,
+             a.id as album_id, a.external_id, a.source, a.title, a.artist, a.year, a.cover_url,
+             u.id as listener_id, u.username as listener_username,
+             u.display_name as listener_display_name, u.avatar_url as listener_avatar_url
+      FROM recommendation_notifications rn
+      JOIN albums a ON a.id = rn.album_id
+      JOIN users u ON u.id = rn.listener_id
+      WHERE rn.recommender_id = ? AND COALESCE(rn.seen, 0) = 0
+      ORDER BY rn.created_at DESC
+    `).all(userId);
+
+    res.json(rows);
+  } catch {
+    res.status(500).json({ error: 'Failed to get recommendation notifications' });
+  }
+});
+
+router.delete('/recommendation-notifications/:id', (req, res) => {
+  try {
+    const userId = req.user.id;
+    db.prepare(
+      'UPDATE recommendation_notifications SET seen = 1 WHERE id = ? AND recommender_id = ?'
+    ).run(req.params.id, userId);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: 'Failed to dismiss notification' });
+  }
+});
+
+router.get('/:id/favorites', (req, res) => {
+  try {
+    const currentUserId = Number(req.user.id);
+    const targetUserId = parseInt(req.params.id, 10);
+
+    if (!canViewFriendData(currentUserId, targetUserId)) {
+      return res.status(403).json({ error: 'You must be friends to view their favorites' });
+    }
+
+    res.json(resolveFavoriteAlbums(targetUserId));
+  } catch {
+    res.status(500).json({ error: 'Failed to get friend favorites' });
+  }
+});
+
+router.get('/:id/favorite-tracks', (req, res) => {
+  try {
+    const currentUserId = Number(req.user.id);
+    const targetUserId = parseInt(req.params.id, 10);
+
+    if (!canViewFriendData(currentUserId, targetUserId)) {
+      return res.status(403).json({ error: 'You must be friends to view their favorite tracks' });
+    }
+
+    res.json(resolveFavoriteTracks(targetUserId));
+  } catch {
+    res.status(500).json({ error: 'Failed to get friend favorite tracks' });
   }
 });
 
@@ -178,38 +265,13 @@ router.delete('/:id', (req, res) => {
   }
 });
 
-router.get('/:id/favorites', (req, res) => {
-  try {
-    const currentUserId = Number(req.user.id);
-    const targetUserId = parseInt(req.params.id, 10);
-
-    if (currentUserId !== targetUserId) {
-      const friendship = db
-        .prepare(
-          `SELECT id FROM friendships
-           WHERE ((user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?))
-             AND status = 'accepted'`
-        )
-        .get(currentUserId, targetUserId, targetUserId, currentUserId);
-
-      if (!friendship) {
-        return res.status(403).json({ error: 'You must be friends to view their favorites' });
-      }
-    }
-
-    res.json(resolveFavoriteAlbums(targetUserId));
-  } catch {
-    res.status(500).json({ error: 'Failed to get friend favorites' });
-  }
-});
-
 router.get('/search', (req, res) => {
   try {
     const { q } = req.query;
     const userId = req.user.id;
 
     let query = `
-      SELECT u.id, u.username, u.display_name,
+      SELECT u.id, u.username, u.display_name, u.avatar_url,
              f.id as friendship_id,
              f.status as friendship_status,
              f.user_id as requester_id
@@ -235,6 +297,7 @@ router.get('/search', (req, res) => {
       id: u.id,
       username: u.username,
       display_name: u.display_name,
+      avatar_url: u.avatar_url || null,
       friendship_id: u.friendship_id,
       friendship_status: u.friendship_status || 'none',
       is_requester: u.requester_id === userId,

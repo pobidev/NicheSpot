@@ -10,6 +10,8 @@ import {
   IconCheck,
   IconSend,
   IconSpinner,
+  IconRefresh,
+  IconEdit,
   IconHeart,
 } from './Icons';
 
@@ -19,35 +21,40 @@ export default function AlbumDetail({
   friends = [],
   onAction,
   onDelete,
-  onDismissRecommendation,
   userAlbum,
-  ownerName = null,
   recommenderName = null,
+  friendContext = null,
 }) {
-  const isFriendView = Boolean(ownerName);
-  const isPendingRec = Boolean(recommenderName);
-  const effectiveUserAlbum = isPendingRec ? null : userAlbum;
+  const effectiveUserAlbum = userAlbum || (!friendContext && album?.status ? album : null);
+  const isPendingRec = Boolean(effectiveUserAlbum?.pending_recommendation === 1);
+  const currentStatus = isPendingRec ? null : effectiveUserAlbum?.status || null;
+  const resolvedRecommender =
+    recommenderName ||
+    effectiveUserAlbum?.recommended_by ||
+    effectiveUserAlbum?.recommended_by_name ||
+    effectiveUserAlbum?.recommended_by_username ||
+    null;
 
-  // Solo permite recomendar si el usuario actual ya tiene el álbum como 'listened'
-  const canRecommend = !isFriendView && !isPendingRec && effectiveUserAlbum?.status === 'listened';
-
-  const [mode, setMode] = useState(null); // 'listened' | 'partially_listened' | 'recommend'
-  const [rating, setRating] = useState(!isFriendView ? (effectiveUserAlbum?.rating ?? null) : null);
-  const [note, setNote] = useState(!isFriendView ? (effectiveUserAlbum?.note || '') : '');
+  const [mode, setMode] = useState(null); // null | 'listened' | 'partially_listened' | 'to_listen_note' | 'recommend'
+  const [rating, setRating] = useState(effectiveUserAlbum?.rating ?? null);
+  const [note, setNote] = useState(effectiveUserAlbum?.note || '');
   const [selectedFriend, setSelectedFriend] = useState('');
   const [actionError, setActionError] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [showAllSummaryTracks, setShowAllSummaryTracks] = useState(false);
 
   const initialTracks = Array.isArray(effectiveUserAlbum?.tracks) ? effectiveUserAlbum.tracks : [];
   const [tracks, setTracks] = useState(
     initialTracks.map((t, idx) => ({
       track_title: typeof t === 'string' ? t : t.track_title || t.title || '',
-      track_number: typeof t === 'object' && t.track_number != null ? t.track_number : idx + 1,
+      track_number:
+        typeof t === 'object' && t.track_number != null ? t.track_number : idx + 1,
       listened: typeof t === 'object' ? Boolean(t.listened) : true,
     }))
   );
   const [loadingTracks, setLoadingTracks] = useState(false);
+  const [tracksSyncInfo, setTracksSyncInfo] = useState('');
+
+  const canRecommend = currentStatus === 'listened' && Array.isArray(friends) && friends.length > 0;
 
   useEffect(() => {
     const originalOverflow = document.body.style.overflow;
@@ -64,53 +71,68 @@ export default function AlbumDetail({
     };
   }, [onClose]);
 
-  const loadAlbumTracklist = useCallback(async () => {
-    if (!album?.artist || !album?.title) return;
-    setLoadingTracks(true);
-    try {
-      const res = await api.getAlbumTracklist({
-        artist: album.artist,
-        title: album.title,
-        external_id: album.external_id || album.id?.toString(),
-        source: album.source || 'musicbrainz',
-        sync_lastfm: true,
-      });
-
-      const fetched = res?.tracks || [];
-      if (fetched.length > 0) {
-        setTracks((prev) => {
-          const prevMap = new Map(prev.map((p) => [p.track_title.toLowerCase().trim(), p.listened]));
-          const matchedTrackLower = album.matched_track?.toLowerCase().trim();
-
-          return fetched.map((ft, idx) => {
-            const key = ft.track_title.toLowerCase().trim();
-            const wasPreviouslyListened = prevMap.get(key) === true;
-            const isMatchedFromSearch = matchedTrackLower && key === matchedTrackLower;
-            return {
-              track_number: ft.track_number || idx + 1,
-              track_title: ft.track_title,
-              listened: Boolean(ft.listened || wasPreviouslyListened || isMatchedFromSearch),
-            };
-          });
+  const loadAlbumTracklist = useCallback(
+    async ({ forceSyncLastfm = true } = {}) => {
+      if (!album?.artist || !album?.title) return;
+      setLoadingTracks(true);
+      setTracksSyncInfo('');
+      try {
+        const res = await api.getAlbumTracklist({
+          artist: album.artist,
+          title: album.title,
+          external_id: album.external_id || album.id?.toString(),
+          source: album.source || 'musicbrainz',
+          sync_lastfm: forceSyncLastfm,
         });
+
+        const fetched = res?.tracks || [];
+        if (fetched.length > 0) {
+          setTracks((prev) => {
+            const prevMap = new Map(
+              prev.map((p) => [p.track_title.toLowerCase().trim(), p.listened])
+            );
+            const matchedTrackLower = album.matched_track?.toLowerCase().trim();
+
+            return fetched.map((ft, idx) => {
+              const key = ft.track_title.toLowerCase().trim();
+              const wasPreviouslyListened = prevMap.get(key) === true;
+              const isMatchedFromSearch = matchedTrackLower && key === matchedTrackLower;
+              return {
+                track_number: ft.track_number || idx + 1,
+                track_title: ft.track_title,
+                listened: Boolean(
+                  ft.listened || wasPreviouslyListened || isMatchedFromSearch
+                ),
+              };
+            });
+          });
+
+          if (res.lastfm_synced) {
+            setTracksSyncInfo(
+              `Sincronizadas ${res.scrobbled_count} canciones desde Last.fm`
+            );
+          }
+        }
+      } catch (err) {
+        console.error('Error cargando tracklist:', err);
+      } finally {
+        setLoadingTracks(false);
       }
-    } catch (err) {
-      console.error('Error cargando tracklist:', err);
-    } finally {
-      setLoadingTracks(false);
+    },
+    [album]
+  );
+
+  useEffect(() => {
+    if (currentStatus === 'partially_listened' && tracks.length === 0) {
+      loadAlbumTracklist({ forceSyncLastfm: true });
     }
-  }, [album]);
+  }, [currentStatus, tracks.length, loadAlbumTracklist]);
 
   const handleOpenPartialMode = () => {
     setMode('partially_listened');
     setActionError('');
-    if (isFriendView || isPendingRec) {
-      setTracks([]);
-      loadAlbumTracklist();
-      return;
-    }
-    if (tracks.length === 0 || tracks.every((t) => t.listened)) {
-      loadAlbumTracklist();
+    if (tracks.length === 0) {
+      loadAlbumTracklist({ forceSyncLastfm: true });
     }
   };
 
@@ -128,14 +150,24 @@ export default function AlbumDetail({
     setTracks((prev) => prev.map((t) => ({ ...t, listened: value })));
   };
 
-  const handleListened = async () => {
+  const handleSaveListened = async () => {
     setActionError('');
     setSubmitting(true);
     try {
+      const normalizedTracks =
+        tracks.length > 0
+          ? tracks.map((t, idx) => ({
+              track_number: t.track_number || idx + 1,
+              track_title: t.track_title,
+              listened: true,
+            }))
+          : undefined;
+
       await onAction({
         status: 'listened',
-        rating: rating || null,
-        note: note.trim() ? note.trim() : null,
+        rating: rating === '' ? null : rating,
+        note: note.trim(),
+        ...(normalizedTracks ? { tracks: normalizedTracks } : {}),
       });
       onClose();
     } catch (err) {
@@ -145,9 +177,26 @@ export default function AlbumDetail({
     }
   };
 
-  const handlePartiallyListened = async () => {
-    const selectedCount = tracks.filter((t) => t.listened).length;
-    if (selectedCount === 0) {
+  const handleQuickAcceptRecommendation = async () => {
+    setActionError('');
+    setSubmitting(true);
+    try {
+      await onAction({
+        status: 'listened',
+        rating: null,
+        note: '',
+      });
+      onClose();
+    } catch (err) {
+      setActionError(err.message || 'Error al guardar');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleSavePartiallyListened = async () => {
+    const listenedTracks = tracks.filter((t) => t.listened);
+    if (listenedTracks.length === 0) {
       setActionError('Marca al menos una canción que hayas escuchado.');
       return;
     }
@@ -157,9 +206,13 @@ export default function AlbumDetail({
     try {
       await onAction({
         status: 'partially_listened',
-        rating: rating || null,
-        note: note.trim() ? note.trim() : null,
-        tracks,
+        rating: rating === '' ? null : rating,
+        note: note.trim(),
+        tracks: tracks.map((t, idx) => ({
+          track_number: t.track_number || idx + 1,
+          track_title: t.track_title,
+          listened: Boolean(t.listened),
+        })),
       });
       onClose();
     } catch (err) {
@@ -169,11 +222,15 @@ export default function AlbumDetail({
     }
   };
 
-  const handleToListen = async () => {
+  const handleToListen = async (keepNote = false) => {
     setActionError('');
     setSubmitting(true);
     try {
-      await onAction({ status: 'to_listen', rating: null, note: null });
+      await onAction({
+        status: 'to_listen',
+        rating: null,
+        note: keepNote ? note.trim() : '',
+      });
       onClose();
     } catch (err) {
       setActionError(err.message || 'Error al guardar');
@@ -182,7 +239,24 @@ export default function AlbumDetail({
     }
   };
 
-  const handleDeleteAlbum = async () => {
+  const handleRecommend = async () => {
+    if (!selectedFriend) {
+      setActionError('Selecciona un amigo');
+      return;
+    }
+    setActionError('');
+    setSubmitting(true);
+    try {
+      await onAction({ type: 'recommend', friend_id: Number(selectedFriend) });
+      onClose();
+    } catch (err) {
+      setActionError(err.message || 'Error al recomendar');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDelete = async () => {
     if (!onDelete) return;
     setActionError('');
     setSubmitting(true);
@@ -196,634 +270,652 @@ export default function AlbumDetail({
     }
   };
 
-  const handleRecommend = async () => {
-    if (!selectedFriend) return;
-    setActionError('');
-    setSubmitting(true);
-    try {
-      await onAction({ type: 'recommend', friend_id: selectedFriend });
-      onClose();
-    } catch (err) {
-      setActionError(err.message || 'Error al recomendar');
-    } finally {
-      setSubmitting(false);
-    }
-  };
+  const listenedTracksCount = tracks.filter((t) => t.listened).length;
+  const allTracksChecked = tracks.length > 0 && listenedTracksCount === tracks.length;
 
-  const renderStatusBadge = (status) => {
-    if (status === 'listened') {
-      return (
-        <span className="text-primary font-semibold flex items-center gap-1">
-          <IconCheck className="w-3.5 h-3.5" /> Escuchado
+  const renderRatingAndNoteFields = () => (
+    <>
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <label className="text-xs font-medium text-muted">
+            Puntuación (opcional, 1 al 10)
+          </label>
+          <button
+            type="button"
+            onClick={() => setRating(null)}
+            className={`text-[11px] font-semibold flex items-center gap-1 transition-colors ${
+              rating == null ? 'text-primary' : 'text-muted hover:text-main'
+            }`}
+          >
+            <IconStar className="w-3 h-3" />
+            <span>{rating == null ? 'Sin puntuar' : 'Quitar nota'}</span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-10 gap-1">
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((num) => {
+            const active = Number(rating) === num;
+            return (
+              <button
+                key={num}
+                type="button"
+                onClick={() => setRating(active ? null : num)}
+                className={`py-2 rounded-lg text-xs font-bold border transition-all active:scale-95 ${
+                  active
+                    ? 'bg-primary text-white border-primary shadow-xs'
+                    : 'bg-inputbg border-borderc text-muted hover:text-main hover:border-primary/50'
+                }`}
+              >
+                {num}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div>
+        <label className="text-xs font-medium text-muted block mb-1.5">
+          Nota o comentario (opcional)
+        </label>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="¿Qué te ha parecido este álbum?"
+          rows={2}
+          className="w-full bg-inputbg border border-borderc rounded-xl p-2.5 text-xs text-main placeholder-muted focus:outline-none focus:border-primary resize-none"
+        />
+      </div>
+    </>
+  );
+
+  const renderSingleTracklistEditor = () => (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-bold text-main">
+          Canciones escuchadas ({listenedTracksCount}/{tracks.length})
         </span>
-      );
-    }
-    if (status === 'partially_listened') {
-      return (
-        <span className="text-amber-400 font-semibold flex items-center gap-1">
-          <IconMusic className="w-3.5 h-3.5" /> Escuchado parcialmente
-        </span>
-      );
-    }
-    return (
-      <span className="text-primary font-semibold flex items-center gap-1">
-        <IconList className="w-3.5 h-3.5" /> Por escuchar
-      </span>
-    );
-  };
+        <div className="flex items-center gap-2 text-[11px]">
+          {tracks.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => handleSelectAllTracks(true)}
+                className="text-primary hover:underline font-medium"
+              >
+                Marcar todas
+              </button>
+              <span className="text-muted">·</span>
+              <button
+                type="button"
+                onClick={() => handleSelectAllTracks(false)}
+                className="text-muted hover:text-main font-medium"
+              >
+                Desmarcar todas
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            disabled={loadingTracks}
+            onClick={() => loadAlbumTracklist({ forceSyncLastfm: true })}
+            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-inputbg border border-borderc text-muted hover:text-primary transition-colors disabled:opacity-50"
+            title="Actualizar lista de canciones y cruzar con Last.fm"
+          >
+            <IconRefresh className={`w-3 h-3 ${loadingTracks ? 'animate-spin' : ''}`} />
+            <span>Last.fm</span>
+          </button>
+        </div>
+      </div>
 
-  const listenedCount = tracks.filter((t) => t.listened).length;
-  const allTracksChecked = tracks.length > 0 && listenedCount === tracks.length;
+      {tracksSyncInfo && (
+        <p className="text-[11px] text-primary font-medium">{tracksSyncInfo}</p>
+      )}
 
-  const summaryTracks = Array.isArray(effectiveUserAlbum?.tracks) ? effectiveUserAlbum.tracks : [];
-  const summaryListenedTracks = summaryTracks.filter((t) => Boolean(t.listened));
-  const summaryUnlistenedTracks = summaryTracks.filter((t) => !t.listened);
+      {loadingTracks ? (
+        <div className="flex items-center justify-center gap-2 py-8 bg-inputbg/60 border border-borderc rounded-xl text-xs text-muted">
+          <IconSpinner className="w-4 h-4 text-primary" />
+          <span>Cargando lista de canciones...</span>
+        </div>
+      ) : tracks.length > 0 ? (
+        <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
+          {tracks.map((track, idx) => (
+            <button
+              key={`${track.track_title}-${idx}`}
+              type="button"
+              onClick={() => handleToggleTrack(idx)}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl border text-left text-xs transition-all ${
+                track.listened
+                  ? 'bg-primarysubtle/70 border-primary/60 text-main font-medium'
+                  : 'bg-inputbg/60 border-borderc text-muted hover:text-main'
+              }`}
+            >
+              <span
+                className={`w-4 h-4 rounded-md flex items-center justify-center flex-shrink-0 border transition-colors ${
+                  track.listened
+                    ? 'bg-primary border-primary text-white'
+                    : 'border-borderc bg-card'
+                }`}
+              >
+                {track.listened && <IconCheck className="w-3 h-3" />}
+              </span>
+              <span className="text-[11px] text-muted w-5 flex-shrink-0">
+                {track.track_number || idx + 1}.
+              </span>
+              <span className="truncate flex-1">{track.track_title}</span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="p-3 rounded-xl bg-inputbg/60 border border-borderc text-xs text-muted text-center">
+          No se encontró el listado oficial de pistas para este lanzamiento.
+        </div>
+      )}
+
+      {allTracksChecked && (
+        <div className="p-2.5 rounded-xl bg-primarysubtle border border-primary/40 flex items-center justify-between gap-2">
+          <span className="text-[11px] text-main font-medium">
+            ¡Has marcado todas las canciones del álbum!
+          </span>
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={handleSaveListened}
+            className="px-2.5 py-1 rounded-lg bg-primary text-white text-[11px] font-bold hover:bg-primaryhover transition-colors flex-shrink-0"
+          >
+            Guardar como Escuchado
+          </button>
+        </div>
+      )}
+    </div>
+  );
 
   const modalContent = (
     <div
-      className="fixed inset-0 z-[100] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto animate-backdrop-in"
       onClick={handleBackdrop}
+      className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
     >
-      <div
-        className="relative w-full max-w-md max-h-[85dvh] overflow-y-auto rounded-2xl bg-card border border-borderc p-5 shadow-2xl animate-modal-in"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="relative bg-card border border-borderc rounded-2xl w-full max-w-md max-h-[88dvh] overflow-y-auto p-5 space-y-4 shadow-2xl">
+        {/* Botón cerrar */}
         <button
+          type="button"
           onClick={onClose}
-          className="absolute top-4 right-4 text-muted hover:text-main p-1.5 rounded-lg hover:bg-cardhover transition-colors z-10"
+          className="absolute top-3.5 right-3.5 w-8 h-8 rounded-full bg-inputbg hover:bg-cardhover text-muted hover:text-main flex items-center justify-center transition-colors"
           aria-label="Cerrar"
         >
-          <IconClose className="w-5 h-5" />
+          <IconClose className="w-4 h-4" />
         </button>
 
-        {/* Cabecera portada + título */}
-        <div className="flex flex-col items-center mb-5 pt-2">
+        {/* Cabecera del álbum */}
+        <div className="flex flex-col items-center text-center pt-1">
           <AlbumCover
             src={album.cover_url}
             alt={album.title}
-            className="w-36 h-36 rounded-xl shadow-md mb-3"
+            className="w-32 h-32 rounded-2xl shadow-lg mb-3 border border-borderc"
             iconSize="w-9 h-9"
-            showTitleFallback
           />
-          <h2 className="text-base font-bold text-main text-center leading-tight px-2">{album.title}</h2>
-          <p className="text-xs text-muted text-center mt-1">
-            {album.artist}{album.year ? ` · ${album.year}` : ''}
+          <h2 className="text-base font-bold text-main leading-snug px-4">{album.title}</h2>
+          <p className="text-xs text-muted mt-0.5">
+            {album.artist}
+            {album.year ? ` · ${album.year}` : ''}
           </p>
           {album.matched_track && (
-            <span className="mt-2 inline-flex items-center gap-1.5 text-xs bg-primarysubtle text-primary px-2.5 py-0.5 rounded-full font-medium">
+            <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-primarysubtle border border-primary/30 text-primary text-[11px] font-medium">
               <IconMusic className="w-3 h-3" />
               <span>Canción: {album.matched_track}</span>
-            </span>
+            </div>
           )}
         </div>
 
-        {/* Banner de recomendación pendiente */}
-        {isPendingRec && (
-          <div className="mb-4 p-3 rounded-xl bg-primarysubtle border border-primary text-xs space-y-1 animate-fade-up">
-            <p className="text-primary font-bold flex items-center gap-1.5">
-              <IconHeart className="w-3.5 h-3.5 fill-current" />
-              <span>Recomendado por {recommenderName}</span>
-            </p>
-            <p className="text-muted text-[11px]">
-              Elige si ya lo has escuchado, si lo llevas a medias o si quieres guardarlo en Por escuchar.
-            </p>
+        {/* Contexto si estamos viendo el álbum desde el perfil de un amigo */}
+        {friendContext && (
+          <div className="p-3 rounded-xl bg-inputbg/80 border border-borderc space-y-1.5 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-muted">
+                En la biblioteca de <strong className="text-main">{friendContext.name}</strong>:
+              </span>
+              <span className="font-semibold text-primary">
+                {friendContext.status === 'listened'
+                  ? 'Escuchado'
+                  : friendContext.status === 'partially_listened'
+                  ? 'Parcial'
+                  : 'Por escuchar'}
+              </span>
+            </div>
+            {friendContext.rating != null && (
+              <p className="text-muted">
+                Nota: <strong className="text-main">{friendContext.rating}/10</strong>
+              </p>
+            )}
+            {friendContext.note && (
+              <p className="text-main/90 italic">"{friendContext.note}"</p>
+            )}
           </div>
         )}
 
-        {/* Resumen de estado actual (propio o del amigo) */}
-        {effectiveUserAlbum && effectiveUserAlbum.status && (
-          <div className="mb-4 p-3 rounded-xl bg-inputbg border border-borderc text-xs text-muted space-y-2 animate-fade-up">
-            <div className="flex items-center justify-between">
-              <span>{isFriendView ? `Estado de ${ownerName}:` : 'Estado actual:'}</span>
-              {renderStatusBadge(effectiveUserAlbum.status)}
+        {/* Banner de quién recomendó este álbum */}
+        {resolvedRecommender && (
+          <div className="p-3 rounded-xl bg-primarysubtle border border-primary/40 space-y-1 text-xs">
+            <div className="flex items-center gap-1.5 font-bold text-primary">
+              <IconHeart className="w-3.5 h-3.5 fill-current" />
+              <span>Recomendado por {resolvedRecommender}</span>
             </div>
-
-            {effectiveUserAlbum.rating != null && (
-              <div className="flex items-center justify-between">
-                <span>Puntuación:</span>
-                <span className="text-primary font-bold flex items-center gap-1">
-                  <IconStar className="w-3.5 h-3.5 fill-current" /> {effectiveUserAlbum.rating}/10
-                </span>
-              </div>
+            {!isPendingRec && currentStatus === 'to_listen' && (
+              <p className="text-[11px] text-muted">
+                Cuando lo marques como Escuchado se le avisará automáticamente en Amigos.
+              </p>
             )}
-
-            {effectiveUserAlbum.note && (
-              <p className="italic pt-1.5 border-t border-borderc text-main">"{effectiveUserAlbum.note}"</p>
+            {isPendingRec && effectiveUserAlbum?.note && (
+              <p className="text-main/90 italic">"{effectiveUserAlbum.note}"</p>
             )}
+          </div>
+        )}
 
-            {effectiveUserAlbum.status === 'partially_listened' && (
-              <div className="pt-2 border-t border-borderc space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-semibold text-main">
-                    Canciones escuchadas ({summaryListenedTracks.length}
-                    {summaryTracks.length > summaryListenedTracks.length ? ` de ${summaryTracks.length}` : ''})
+        {/* Caja de estado actual (solo cuando ya está en tu biblioteca y NO es recomendación pendiente) */}
+        {currentStatus && (
+          <div className="p-3 rounded-xl bg-inputbg/70 border border-borderc flex items-center justify-between gap-2 text-xs">
+            <span className="text-muted font-medium">Estado actual:</span>
+            {currentStatus === 'listened' && (
+              <span className="inline-flex items-center gap-1.5 font-bold text-primary">
+                <IconCheck className="w-3.5 h-3.5" />
+                <span>Escuchado</span>
+                {effectiveUserAlbum?.rating != null && (
+                  <span className="px-1.5 py-0.5 rounded bg-primarysubtle text-primary text-[11px]">
+                    {effectiveUserAlbum.rating}/10
                   </span>
-                  {summaryUnlistenedTracks.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setShowAllSummaryTracks((prev) => !prev)}
-                      className="text-[11px] text-primary hover:text-primaryhover font-medium"
-                    >
-                      {showAllSummaryTracks ? 'Ver solo escuchadas' : `Ver todas (${summaryTracks.length})`}
-                    </button>
-                  )}
-                </div>
-
-                {summaryListenedTracks.length > 0 ? (
-                  <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
-                    {(showAllSummaryTracks ? summaryTracks : summaryListenedTracks).map((t, idx) => (
-                      <div
-                        key={`${t.track_title}-${idx}`}
-                        className={`flex items-center gap-2 px-2 py-1 rounded-lg text-[11px] border ${
-                          t.listened
-                            ? 'bg-primarysubtle text-main border-primary font-medium'
-                            : 'bg-card text-muted border-borderc'
-                        }`}
-                      >
-                        <span
-                          className={`w-3.5 h-3.5 rounded flex items-center justify-center flex-shrink-0 ${
-                            t.listened ? 'bg-primary text-white' : 'border border-borderc'
-                          }`}
-                        >
-                          {t.listened && <IconCheck className="w-2.5 h-2.5" />}
-                        </span>
-                        <span className="text-[10px] text-muted w-4 flex-shrink-0">
-                          {t.track_number || idx + 1}.
-                        </span>
-                        <span className="truncate">{t.track_title}</span>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-[11px] text-muted italic">
-                    Aún no hay canciones específicas marcadas en este álbum.
-                  </p>
                 )}
-              </div>
+              </span>
+            )}
+            {currentStatus === 'partially_listened' && (
+              <span className="inline-flex items-center gap-1.5 font-bold text-amber-400">
+                <IconMusic className="w-3.5 h-3.5" />
+                <span>Escuchado parcialmente</span>
+                {tracks.length > 0 && (
+                  <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 text-[11px]">
+                    {listenedTracksCount}/{tracks.length}
+                  </span>
+                )}
+              </span>
+            )}
+            {currentStatus === 'to_listen' && (
+              <span className="inline-flex items-center gap-1.5 font-bold text-primary">
+                <IconList className="w-3.5 h-3.5" />
+                <span>Por escuchar</span>
+              </span>
             )}
           </div>
         )}
 
         {actionError && (
-          <div className="mb-4 p-2.5 rounded-xl bg-red-500/15 border border-red-500/30 text-red-400 text-xs text-center font-medium">
+          <div className="p-2.5 rounded-xl bg-red-500/15 border border-red-500/30 text-red-400 text-xs text-center font-medium">
             {actionError}
           </div>
         )}
 
-        {/* MENÚ PRINCIPAL DE ACCIONES */}
-        {!mode && (
-          <div className="flex flex-col gap-2.5 animate-fade-up">
-            {!isFriendView && effectiveUserAlbum?.status === 'partially_listened' ? (
-              <>
-                <button
-                  onClick={handleOpenPartialMode}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-primary hover:bg-primaryhover text-white font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  <IconMusic className="w-4 h-4" />
-                  <span>Editar canciones escuchadas</span>
-                </button>
-                <button
-                  onClick={() => { setMode('listened'); setActionError(''); }}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  <IconCheck className="w-4 h-4 text-primary" />
-                  <span>Escuchado</span>
-                </button>
-                <button
-                  onClick={handleToListen}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  <IconList className="w-4 h-4 text-primary" />
-                  <span>Mover a Por escuchar</span>
-                </button>
-              </>
-            ) : !isFriendView && effectiveUserAlbum?.status === 'listened' ? (
-              <>
-                <button
-                  onClick={() => { setMode('listened'); setActionError(''); }}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-primary hover:bg-primaryhover text-white font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  <IconStar className="w-4 h-4" />
-                  <span>Editar puntuación o nota</span>
-                </button>
-                <button
-                  onClick={handleOpenPartialMode}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-inputbg hover:bg-cardhover border border-amber-500/30 text-main font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  <IconMusic className="w-4 h-4 text-amber-400" />
-                  <span>Cambiar a Escuchado parcialmente</span>
-                </button>
-                <button
-                  onClick={handleToListen}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  <IconList className="w-4 h-4 text-primary" />
-                  <span>Mover a Por escuchar</span>
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  onClick={() => {
-                    if (isPendingRec) {
-                      handleListened();
-                    } else {
-                      setMode('listened');
-                      setActionError('');
-                    }
-                  }}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-primary hover:bg-primaryhover disabled:opacity-50 text-white font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  {submitting && isPendingRec ? (
-                    <>
-                      <IconSpinner className="w-4 h-4 text-white" />
-                      <span>Guardando...</span>
-                    </>
-                  ) : (
-                    <>
-                      <IconCheck className="w-4 h-4" />
-                      <span>
-                        {isPendingRec
-                          ? '¡Ya lo he escuchado!'
-                          : isFriendView
-                          ? 'Añadir a mi lista como Escuchado'
-                          : 'Escuchado'}
-                      </span>
-                    </>
-                  )}
-                </button>
-                <button
-                  onClick={handleOpenPartialMode}
-                  disabled={submitting}
-                  className="w-full py-2.5 px-4 rounded-xl bg-inputbg hover:bg-cardhover border border-amber-500/30 text-main font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                >
-                  <IconMusic className="w-4 h-4 text-amber-400" />
-                  <span>
-                    {isFriendView ? 'Añadir a mi lista como Parcial' : 'Escuchado parcialmente'}
-                  </span>
-                </button>
-                {(!effectiveUserAlbum || isFriendView || effectiveUserAlbum.status !== 'to_listen') && (
-                  <button
-                    onClick={handleToListen}
-                    disabled={submitting}
-                    className="w-full py-2.5 px-4 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
-                  >
-                    <IconList className="w-4 h-4 text-primary" />
-                    <span>{isFriendView ? 'Añadir a mi Por escuchar' : 'Guardar en Por escuchar'}</span>
-                  </button>
-                )}
-              </>
-            )}
+        {/* 1. ÁLBUM YA EN "ESCUCHADOS" */}
+        {currentStatus === 'listened' && mode !== 'recommend' && (
+          <div className="space-y-3">
+            {renderRatingAndNoteFields()}
 
-            {/* Solo permite recomendar si ya lo has escuchado */}
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={handleSaveListened}
+              className="w-full py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              {submitting ? <IconSpinner className="w-4 h-4" /> : <IconCheck className="w-4 h-4" />}
+              <span>Guardar cambios</span>
+            </button>
+
             {canRecommend && (
               <button
-                onClick={() => { setMode('recommend'); setActionError(''); }}
-                disabled={submitting}
-                className="w-full py-2.5 px-4 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 shadow-xs"
+                type="button"
+                onClick={() => {
+                  setMode('recommend');
+                  setActionError('');
+                }}
+                className="w-full py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
               >
-                <IconSend className="w-4 h-4 text-primary" />
+                <IconSend className="w-3.5 h-3.5 text-primary" />
                 <span>Recomendar a un amigo</span>
               </button>
             )}
 
-            {isPendingRec && onDismissRecommendation && (
+            {onDelete && (
               <button
                 type="button"
-                onClick={async () => {
-                  setSubmitting(true);
-                  try {
-                    await onDismissRecommendation();
-                    onClose();
-                  } finally {
-                    setSubmitting(false);
-                  }
-                }}
                 disabled={submitting}
-                className="w-full py-2.5 px-4 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 mt-1"
+                onClick={handleDelete}
+                className="w-full py-2.5 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
               >
-                <IconClose className="w-4 h-4" />
+                <IconClose className="w-3.5 h-3.5" />
+                <span>Eliminar de mi biblioteca</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* 2. ÁLBUM EN "ESCUCHADO PARCIALMENTE" */}
+        {currentStatus === 'partially_listened' && (
+          <div className="space-y-3">
+            {renderSingleTracklistEditor()}
+            {renderRatingAndNoteFields()}
+
+            <button
+              type="button"
+              disabled={submitting || loadingTracks}
+              onClick={handleSavePartiallyListened}
+              className="w-full py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              {submitting ? <IconSpinner className="w-4 h-4" /> : <IconCheck className="w-4 h-4" />}
+              <span>Guardar cambios</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={handleSaveListened}
+              className="w-full py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-primary/50 text-primary text-xs font-bold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              <IconCheck className="w-3.5 h-3.5" />
+              <span>Escuchado</span>
+            </button>
+
+            {onDelete && (
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={handleDelete}
+                className="w-full py-2.5 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                <IconClose className="w-3.5 h-3.5" />
+                <span>Eliminar de mi biblioteca</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* 3. ÁLBUM EN "POR ESCUCHAR" */}
+        {currentStatus === 'to_listen' && mode === null && (
+          <div className="space-y-2.5">
+            {effectiveUserAlbum?.note && (
+              <div className="p-2.5 rounded-xl bg-inputbg/50 border border-borderc text-xs text-muted">
+                Nota guardada: <span className="text-main">{effectiveUserAlbum.note}</span>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setMode('listened');
+                setActionError('');
+              }}
+              className="w-full py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 shadow-xs"
+            >
+              <IconCheck className="w-4 h-4" />
+              <span>Escuchado</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleOpenPartialMode}
+              className="w-full py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
+            >
+              <IconMusic className="w-3.5 h-3.5 text-amber-400" />
+              <span>Escuchado parcialmente (elegir canciones)</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setMode('to_listen_note');
+                setActionError('');
+              }}
+              className="w-full py-2 rounded-xl bg-inputbg/50 hover:bg-cardhover border border-borderc text-muted hover:text-main text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
+            >
+              <IconEdit className="w-3.5 h-3.5" />
+              <span>Editar nota en Por escuchar</span>
+            </button>
+
+            {onDelete && (
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={handleDelete}
+                className="w-full py-2.5 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                <IconClose className="w-3.5 h-3.5" />
+                <span>Eliminar de Por escuchar</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Sub-modo: Editar nota manteniendo el álbum en "Por escuchar" */}
+        {currentStatus === 'to_listen' && mode === 'to_listen_note' && (
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs font-medium text-muted block mb-1.5">
+                Nota o recordatorio en Por escuchar
+              </label>
+              <textarea
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Ej. Recomendado por..., escuchar con calma..."
+                rows={3}
+                className="w-full bg-inputbg border border-borderc rounded-xl p-2.5 text-xs text-main placeholder-muted focus:outline-none focus:border-primary resize-none"
+              />
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setMode(null)}
+                className="flex-1 py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-xs text-muted font-semibold"
+              >
+                Volver
+              </button>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => handleToListen(true)}
+                className="flex-1 py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                {submitting ? <IconSpinner className="w-4 h-4" /> : <IconCheck className="w-4 h-4" />}
+                <span>Guardar nota</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 4. RECOMENDACIÓN PENDIENTE RECIBIDA */}
+        {isPendingRec && mode === null && (
+          <div className="space-y-2.5">
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={handleQuickAcceptRecommendation}
+              className="w-full py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              {submitting ? <IconSpinner className="w-4 h-4" /> : <IconCheck className="w-4 h-4" />}
+              <span>¡Ya lo he escuchado!</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleToListen(false)}
+              className="w-full py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              <IconList className="w-3.5 h-3.5 text-primary" />
+              <span>Añadir a Por escuchar</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleOpenPartialMode}
+              className="w-full py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
+            >
+              <IconMusic className="w-3.5 h-3.5 text-amber-400" />
+              <span>Escuchado parcialmente</span>
+            </button>
+
+            {onDelete && (
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={handleDelete}
+                className="w-full py-2.5 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                <IconClose className="w-3.5 h-3.5" />
                 <span>Descartar recomendación</span>
               </button>
             )}
-
-            {!isFriendView && !isPendingRec && onDelete && (effectiveUserAlbum?.user_album_id || effectiveUserAlbum?.id) && (
-              <button
-                type="button"
-                onClick={handleDeleteAlbum}
-                disabled={submitting}
-                className="w-full py-2.5 px-4 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 font-semibold text-xs transition-all active:scale-[0.98] flex items-center justify-center gap-2 mt-1"
-              >
-                <IconClose className="w-4 h-4" />
-                <span>
-                  {effectiveUserAlbum?.status === 'to_listen'
-                    ? 'Eliminar de Por escuchar'
-                    : 'Eliminar de mi biblioteca'}
-                </span>
-              </button>
-            )}
           </div>
         )}
 
-        {/* MODO ESCUCHADO COMPLETO */}
-        {mode === 'listened' && (
-          <div className="space-y-4 pt-1 animate-fade-up">
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-semibold text-muted">Puntuación (opcional, 1 al 10)</label>
-                <div className="flex items-center gap-2">
-                  {rating != null && (
-                    <button
-                      type="button"
-                      onClick={() => setRating(null)}
-                      className="text-[11px] text-muted hover:text-main underline"
-                    >
-                      Quitar nota
-                    </button>
-                  )}
-                  <span className="text-xs font-bold text-primary flex items-center gap-1">
-                    <IconStar className="w-3.5 h-3.5 fill-current" />
-                    {rating != null ? `${rating}/10` : 'Sin puntuar'}
-                  </span>
-                </div>
-              </div>
-              <div className="grid grid-cols-5 gap-1.5 sm:flex sm:gap-1">
-                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
-                  <button
-                    key={n}
-                    type="button"
-                    onClick={() => setRating((prev) => (prev === n ? null : n))}
-                    className={`h-9 rounded-lg font-bold text-xs transition-all active:scale-95 ${
-                      rating != null && n <= rating
-                        ? 'bg-primary text-white shadow-xs'
-                        : 'bg-inputbg text-muted hover:bg-cardhover border border-borderc'
-                    }`}
-                  >
-                    {n}
-                  </button>
-                ))}
-              </div>
-            </div>
+        {/* 5. ÁLBUM NUEVO */}
+        {!currentStatus && !isPendingRec && mode === null && (
+          <div className="space-y-2.5">
+            <button
+              type="button"
+              onClick={() => {
+                setMode('listened');
+                setActionError('');
+              }}
+              className="w-full py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold transition-colors flex items-center justify-center gap-1.5"
+            >
+              <IconCheck className="w-4 h-4" />
+              <span>Escuchado</span>
+            </button>
 
-            <div>
-              <label className="text-xs font-semibold text-muted mb-1 block">Nota o comentario (opcional)</label>
-              <textarea
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                rows={2}
-                className="w-full bg-inputbg border border-borderc rounded-xl p-2.5 text-main text-xs resize-none focus:outline-none focus:border-primary transition-colors"
-                placeholder="¿Qué te pareció este álbum?"
-              />
-            </div>
+            <button
+              type="button"
+              onClick={handleOpenPartialMode}
+              className="w-full py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
+            >
+              <IconMusic className="w-3.5 h-3.5 text-amber-400" />
+              <span>Escuchado parcialmente (elegir canciones)</span>
+            </button>
 
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => { setMode(null); setActionError(''); }}
-                className="flex-1 py-2.5 rounded-xl bg-inputbg border border-borderc text-main font-semibold text-xs hover:bg-cardhover transition-colors active:scale-[0.98]"
-              >
-                Volver
-              </button>
-              <button
-                type="button"
-                onClick={handleListened}
-                disabled={submitting}
-                className="flex-1 py-2.5 rounded-xl bg-primary hover:bg-primaryhover disabled:opacity-50 text-white font-semibold text-xs transition-colors shadow-xs active:scale-[0.98] flex items-center justify-center gap-1.5"
-              >
-                {submitting ? (
-                  <>
-                    <IconSpinner className="w-4 h-4 text-white" />
-                    <span>Guardando...</span>
-                  </>
-                ) : (
-                  <span>Guardar</span>
-                )}
-              </button>
-            </div>
+            <button
+              type="button"
+              disabled={submitting}
+              onClick={() => handleToListen(false)}
+              className="w-full py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-main text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+            >
+              <IconList className="w-3.5 h-3.5 text-primary" />
+              <span>Añadir a Por escuchar</span>
+            </button>
           </div>
         )}
 
-        {/* MODO ESCUCHADO PARCIALMENTE */}
-        {mode === 'partially_listened' && (
-          <div className="space-y-4 pt-1 animate-fade-up">
-            <div className="space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <label className="text-xs font-semibold text-muted">
-                  Canciones escuchadas ({listenedCount}/{tracks.length})
-                </label>
+        {/* SUB-MODO: Formulario "Escuchado" */}
+        {currentStatus !== 'listened' &&
+          currentStatus !== 'partially_listened' &&
+          mode === 'listened' && (
+            <div className="space-y-3 pt-1 border-t border-borderc">
+              <p className="text-xs font-bold text-main">
+                Marcar álbum completo como Escuchado
+              </p>
+              {renderRatingAndNoteFields()}
 
-                {tracks.length > 0 && (
-                  <div className="flex items-center gap-2 text-[11px]">
-                    <button
-                      type="button"
-                      onClick={() => handleSelectAllTracks(true)}
-                      className="text-muted hover:text-main transition-colors"
-                    >
-                      Marcar todas
-                    </button>
-                    <span className="text-muted">·</span>
-                    <button
-                      type="button"
-                      onClick={() => handleSelectAllTracks(false)}
-                      className="text-muted hover:text-main transition-colors"
-                    >
-                      Desmarcar todas
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {loadingTracks ? (
-                <div className="flex items-center justify-center gap-2 py-6 text-xs text-muted bg-inputbg rounded-xl border border-borderc">
-                  <IconSpinner className="w-4 h-4 text-primary" />
-                  <span>Obteniendo lista de canciones...</span>
-                </div>
-              ) : tracks.length > 0 ? (
-                <div className="space-y-1 max-h-56 overflow-y-auto pr-1">
-                  {tracks.map((t, idx) => (
-                    <button
-                      key={`${t.track_title}-${idx}`}
-                      type="button"
-                      onClick={() => handleToggleTrack(idx)}
-                      className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-xs text-left transition-colors ${
-                        t.listened
-                          ? 'bg-primarysubtle border-primary'
-                          : 'bg-inputbg border-borderc hover:bg-cardhover'
-                      }`}
-                    >
-                      <span
-                        className={`w-4 h-4 rounded flex items-center justify-center border flex-shrink-0 transition-all ${
-                          t.listened
-                            ? 'bg-primary border-primary text-white scale-105'
-                            : 'border-borderc bg-card text-transparent'
-                        }`}
-                      >
-                        <IconCheck className="w-2.5 h-2.5" />
-                      </span>
-                      <span className="text-[11px] text-muted w-4 flex-shrink-0">
-                        {t.track_number || idx + 1}.
-                      </span>
-                      <span className={`truncate ${t.listened ? 'text-main font-medium' : 'text-muted'}`}>
-                        {t.track_title}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-[11px] text-muted bg-inputbg border border-borderc rounded-xl p-3 text-center">
-                  No se encontró el listado de canciones para este álbum.
-                </p>
-              )}
-
-              {allTracksChecked && (
-                <div className="p-2.5 rounded-xl bg-primarysubtle border border-primary flex items-center justify-between gap-2 animate-fade-up">
-                  <span className="text-[11px] text-main font-medium">
-                    ¡Has marcado todas las canciones!
-                  </span>
-                  <button
-                    type="button"
-                    onClick={handleListened}
-                    disabled={submitting}
-                    className="px-2.5 py-1 rounded-lg bg-primary text-white text-[11px] font-semibold flex-shrink-0 active:scale-95 transition-transform"
-                  >
-                    Pasar a Escuchado
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-semibold text-muted">Puntuación (opcional, 1 al 10)</label>
-                <div className="flex items-center gap-2">
-                  {rating != null && (
-                    <button
-                      type="button"
-                      onClick={() => setRating(null)}
-                      className="text-[11px] text-muted hover:text-main underline"
-                    >
-                      Quitar nota
-                    </button>
-                  )}
-                  <span className="text-xs font-bold text-primary flex items-center gap-1">
-                    <IconStar className="w-3.5 h-3.5 fill-current" />
-                    {rating != null ? `${rating}/10` : 'Sin puntuar'}
-                  </span>
-                </div>
-              </div>
-              <div className="grid grid-cols-5 gap-1.5 sm:flex sm:gap-1">
-                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
-                  <button
-                    key={n}
-                    type="button"
-                    onClick={() => setRating((prev) => (prev === n ? null : n))}
-                    className={`h-9 rounded-lg font-bold text-xs transition-all active:scale-95 ${
-                      rating != null && n <= rating
-                        ? 'bg-primary text-white shadow-xs'
-                        : 'bg-inputbg text-muted hover:bg-cardhover border border-borderc'
-                    }`}
-                  >
-                    {n}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div>
-              <label className="text-xs font-semibold text-muted mb-1 block">Nota o comentario (opcional)</label>
-              <textarea
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                rows={2}
-                className="w-full bg-inputbg border border-borderc rounded-xl p-2.5 text-main text-xs resize-none focus:outline-none focus:border-primary transition-colors"
-                placeholder="¿Qué te parecen estas canciones de momento?"
-              />
-            </div>
-
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => { setMode(null); setActionError(''); }}
-                className="flex-1 py-2.5 rounded-xl bg-inputbg border border-borderc text-main font-semibold text-xs hover:bg-cardhover transition-colors active:scale-[0.98]"
-              >
-                Volver
-              </button>
-              <button
-                type="button"
-                onClick={handlePartiallyListened}
-                disabled={submitting || tracks.length === 0}
-                className="flex-1 py-2.5 rounded-xl bg-primary hover:bg-primaryhover disabled:opacity-50 text-white font-semibold text-xs transition-colors shadow-xs active:scale-[0.98] flex items-center justify-center gap-1.5"
-              >
-                {submitting ? (
-                  <>
-                    <IconSpinner className="w-4 h-4 text-white" />
-                    <span>Guardando...</span>
-                  </>
-                ) : (
-                  <span>Guardar</span>
-                )}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* MODO RECOMENDAR */}
-        {mode === 'recommend' && (
-          <div className="space-y-4 pt-1 animate-fade-up">
-            <div>
-              <label className="text-xs font-semibold text-muted mb-1.5 block">Selecciona un amigo</label>
-              {friends.length > 0 ? (
-                <select
-                  value={selectedFriend}
-                  onChange={(e) => { setSelectedFriend(e.target.value); setActionError(''); }}
-                  className="w-full bg-inputbg border border-borderc rounded-xl p-2.5 text-main text-xs focus:outline-none focus:border-primary transition-colors"
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMode(null)}
+                  className="flex-1 py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-xs text-muted font-semibold"
                 >
-                  <option value="">-- Elige un amigo --</option>
-                  {friends.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.display_name || f.username} (@{f.username})
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <p className="text-xs text-muted p-3 bg-inputbg rounded-xl border border-borderc">
-                  Aún no tienes amigos aceptados. Añade amigos en la pestaña Amigos.
-                </p>
-              )}
+                  Volver
+                </button>
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={handleSaveListened}
+                  className="flex-1 py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold flex items-center justify-center gap-1.5 disabled:opacity-50"
+                >
+                  {submitting ? (
+                    <IconSpinner className="w-4 h-4" />
+                  ) : (
+                    <IconCheck className="w-4 h-4" />
+                  )}
+                  <span>Guardar en Escuchados</span>
+                </button>
+              </div>
             </div>
+          )}
+
+        {/* SUB-MODO: Formulario "Escuchado parcialmente" */}
+        {currentStatus !== 'partially_listened' && mode === 'partially_listened' && (
+          <div className="space-y-3 pt-1 border-t border-borderc">
+            {renderSingleTracklistEditor()}
+            {renderRatingAndNoteFields()}
 
             <div className="flex gap-2">
               <button
                 type="button"
-                onClick={() => { setMode(null); setActionError(''); }}
-                className="flex-1 py-2.5 rounded-xl bg-inputbg border border-borderc text-main font-semibold text-xs hover:bg-cardhover transition-colors active:scale-[0.98]"
+                onClick={() => setMode(null)}
+                className="flex-1 py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-xs text-muted font-semibold"
               >
                 Volver
               </button>
               <button
                 type="button"
-                onClick={handleRecommend}
-                disabled={!selectedFriend || submitting}
-                className="flex-1 py-2.5 rounded-xl bg-primary hover:bg-primaryhover disabled:opacity-50 text-white font-semibold text-xs transition-colors shadow-xs active:scale-[0.98] flex items-center justify-center gap-1.5"
+                disabled={submitting || loadingTracks}
+                onClick={handleSavePartiallyListened}
+                className="flex-1 py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold flex items-center justify-center gap-1.5 disabled:opacity-50"
               >
                 {submitting ? (
-                  <>
-                    <IconSpinner className="w-4 h-4 text-white" />
-                    <span>Enviando...</span>
-                  </>
+                  <IconSpinner className="w-4 h-4" />
                 ) : (
-                  <>
-                    <IconSend className="w-3.5 h-3.5" />
-                    <span>Enviar recomendación</span>
-                  </>
+                  <IconCheck className="w-4 h-4" />
                 )}
+                <span>Guardar parcial</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* SUB-MODO: Recomendar a un amigo (solo si status === 'listened') */}
+        {mode === 'recommend' && canRecommend && (
+          <div className="space-y-3 pt-1 border-t border-borderc">
+            <div>
+              <label className="text-xs font-medium text-muted block mb-1.5">
+                Elige a un amigo para recomendarle este álbum
+              </label>
+              <select
+                value={selectedFriend}
+                onChange={(e) => setSelectedFriend(e.target.value)}
+                className="w-full bg-inputbg border border-borderc rounded-xl p-2.5 text-xs text-main focus:outline-none focus:border-primary"
+              >
+                <option value="">Selecciona un amigo...</option>
+                {friends.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.display_name} (@{f.username})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setMode(null)}
+                className="flex-1 py-2.5 rounded-xl bg-inputbg hover:bg-cardhover border border-borderc text-xs text-muted font-semibold"
+              >
+                Volver
+              </button>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={handleRecommend}
+                className="flex-1 py-2.5 rounded-xl bg-primary hover:bg-primaryhover text-white text-xs font-bold flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                {submitting ? (
+                  <IconSpinner className="w-4 h-4" />
+                ) : (
+                  <IconSend className="w-3.5 h-3.5" />
+                )}
+                <span>Enviar recomendación</span>
               </button>
             </div>
           </div>

@@ -59,13 +59,24 @@ export const recommendAlbum = (data) => api('/api/albums/recommend', { method: '
 export const getFriends = () => api('/api/friends');
 export const getPending = () => api('/api/friends/pending');
 export const getRecommendations = () => api('/api/friends/recommendations');
+export const dismissRecommendation = (albumId) =>
+  api(`/api/friends/recommendations/${albumId}`, { method: 'DELETE' });
+export const getRecommendationNotifications = () => api('/api/friends/recommendation-notifications');
+export const dismissRecommendationNotification = (id) =>
+  api(`/api/friends/recommendation-notifications/${id}`, { method: 'DELETE' });
 export const sendFriendRequest = (data) => api('/api/friends/request', { method: 'POST', body: JSON.stringify(data) });
 export const acceptFriend = (id) => api(`/api/friends/${id}/accept`, { method: 'PUT' });
 export const removeFriend = (id) => api(`/api/friends/${id}`, { method: 'DELETE' });
 export const searchUsers = (q = '') => api('/api/friends/search' + (q ? `?q=${encodeURIComponent(q)}` : ''));
 export const getFriendFavorites = (userId) => api(`/api/friends/${userId}/favorites`);
+export const getFriendFavoriteTracks = (userId) => api(`/api/friends/${userId}/favorite-tracks`);
 
 export const getProfile = () => api('/api/profile');
 export const updateProfile = (data) => api('/api/profile', { method: 'PUT', body: JSON.stringify(data) });
-export const updateFavorites = (albumIds) => api('/api/profile/favorites', { method: 'PUT', body: JSON.stringify({ album_ids: albumIds }) });
+export const updateFavorites = (albumIds) =>
+  api('/api/profile/favorites', { method: 'PUT', body: JSON.stringify({ album_ids: albumIds }) });
+export const getFavoriteTracks = () => api('/api/profile/favorite-tracks');
+export const updateFavoriteTracks = (tracks) =>
+  api('/api/profile/favorite-tracks', { method: 'PUT', body: JSON.stringify({ tracks }) });
 export const syncLastfm = () => api('/api/profile/sync-lastfm', { method: 'POST' });
+export const getLastfmSyncStatus = () => api('/api/profile/sync-lastfm/status');

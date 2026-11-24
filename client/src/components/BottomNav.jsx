@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 import * as api from '../api';
 import { IconSearch, IconUsers, IconUser } from './Icons';
 
@@ -11,27 +12,39 @@ const tabs = [
 
 export default function BottomNav() {
   const location = useLocation();
-  const [pendingRecsCount, setPendingRecsCount] = useState(0);
+  const { user } = useAuth();
+  const [badgeCount, setBadgeCount] = useState(0);
+  const [avatarFailed, setAvatarFailed] = useState(false);
 
   useEffect(() => {
-    const refreshRecsCount = () => {
-      api
-        .getRecommendations()
-        .then((list) => setPendingRecsCount(Array.isArray(list) ? list.length : 0))
-        .catch(() => {});
+    setAvatarFailed(false);
+  }, [user?.avatar_url]);
+
+  useEffect(() => {
+    const refreshBadgeCount = () => {
+      Promise.all([
+        api.getRecommendations().catch(() => []),
+        api.getRecommendationNotifications().catch(() => []),
+      ]).then(([recs, notifs]) => {
+        const recsLen = Array.isArray(recs) ? recs.length : 0;
+        const notifsLen = Array.isArray(notifs) ? notifs.length : 0;
+        setBadgeCount(recsLen + notifsLen);
+      });
     };
 
-    refreshRecsCount();
-    window.addEventListener('recommendations-updated', refreshRecsCount);
-    window.addEventListener('focus', refreshRecsCount);
-    const interval = setInterval(refreshRecsCount, 30000);
+    refreshBadgeCount();
+    window.addEventListener('recommendations-updated', refreshBadgeCount);
+    window.addEventListener('focus', refreshBadgeCount);
+    const interval = setInterval(refreshBadgeCount, 30000);
 
     return () => {
-      window.removeEventListener('recommendations-updated', refreshRecsCount);
-      window.removeEventListener('focus', refreshRecsCount);
+      window.removeEventListener('recommendations-updated', refreshBadgeCount);
+      window.removeEventListener('focus', refreshBadgeCount);
       clearInterval(interval);
     };
   }, [location.pathname]);
+
+  const hasUserAvatar = Boolean(user?.avatar_url) && !avatarFailed;
 
   return (
     <nav
@@ -58,10 +71,21 @@ export default function BottomNav() {
             {({ isActive }) => (
               <>
                 <div className="relative inline-flex items-center justify-center">
-                  <Icon className={`w-5 h-5 transition-transform ${isActive ? 'scale-110' : ''}`} />
-                  {to === '/friends' && pendingRecsCount > 0 && (
+                  {to === '/profile' && hasUserAvatar ? (
+                    <img
+                      src={user.avatar_url}
+                      alt={user.display_name || user.username || 'Perfil'}
+                      onError={() => setAvatarFailed(true)}
+                      className={`w-5 h-5 rounded-full object-cover transition-transform ${
+                        isActive ? 'scale-110 ring-2 ring-primary' : 'ring-1 ring-borderc'
+                      }`}
+                    />
+                  ) : (
+                    <Icon className={`w-5 h-5 transition-transform ${isActive ? 'scale-110' : ''}`} />
+                  )}
+                  {to === '/friends' && badgeCount > 0 && (
                     <span className="absolute -top-1.5 -right-2.5 min-w-[17px] h-[17px] px-1 rounded-full bg-primary text-white text-[10px] font-extrabold flex items-center justify-center shadow-xs">
-                      {pendingRecsCount > 9 ? '9+' : pendingRecsCount}
+                      {badgeCount > 9 ? '9+' : badgeCount}
                     </span>
                   )}
                 </div>

@@ -18,7 +18,7 @@ router.post('/register', (req, res) => {
       'INSERT INTO users (username, password_hash, display_name) VALUES (?, ?, ?)'
     ).run(username, passwordHash, display_name);
 
-    const user = { id: result.lastInsertRowid, username, display_name };
+    const user = { id: result.lastInsertRowid, username, display_name, avatar_url: null };
     const token = generateToken(user);
 
     res.status(201).json({ token, user });
@@ -51,6 +51,7 @@ router.post('/login', (req, res) => {
         username: user.username,
         display_name: user.display_name,
         lastfm_username: user.lastfm_username,
+        avatar_url: user.avatar_url || null,
       },
     });
   } catch {
@@ -61,7 +62,7 @@ router.post('/login', (req, res) => {
 router.get('/me', authenticateToken, (req, res) => {
   try {
     const user = db.prepare(
-      'SELECT id, username, display_name, lastfm_username, created_at FROM users WHERE id = ?'
+      'SELECT id, username, display_name, lastfm_username, avatar_url, created_at FROM users WHERE id = ?'
     ).get(req.user.id);
 
     if (!user) return res.status(404).json({ error: 'User not found' });

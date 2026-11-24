@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import * as api from '../api';
 import AlbumCard, { AlbumCover } from '../components/AlbumCard';
 import AlbumDetail from '../components/AlbumDetail';
+import UserAvatar from '../components/UserAvatar';
 import {
   IconSearch,
   IconMusic,
@@ -39,6 +40,10 @@ const SEARCH_TABS = [
   },
 ];
 
+function normalizeKey(artist, title) {
+  return `${String(artist || '').trim().toLowerCase()}:::${String(title || '').trim().toLowerCase()}`;
+}
+
 export default function Search() {
   const [searchType, setSearchType] = useState('artist');
   const [query, setQuery] = useState('');
@@ -47,6 +52,7 @@ export default function Search() {
   const [totalResults, setTotalResults] = useState(0);
   const [results, setResults] = useState([]);
   const [feed, setFeed] = useState([]);
+  const [userAlbums, setUserAlbums] = useState([]);
   const [selectedAlbum, setSelectedAlbum] = useState(null);
   const [friends, setFriends] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -55,12 +61,54 @@ export default function Search() {
   const requestSeqRef = useRef(0);
   const activeTabMeta = SEARCH_TABS.find((t) => t.id === searchType) || SEARCH_TABS[0];
 
+  const refreshLibrary = useCallback(() => {
+    api.getUserAlbums().then((data) => setUserAlbums(Array.isArray(data) ? data : [])).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    refreshLibrary();
+  }, [refreshLibrary]);
+
   useEffect(() => {
     api.getFriends().then(setFriends).catch(() => []);
     if (!query.trim()) {
       api.getFeed().then(setFeed).catch(() => setFeed([]));
     }
   }, [query]);
+
+  // Mapa rápido para detectar si un álbum del buscador o feed ya está en la biblioteca del usuario
+  const userAlbumLookup = useMemo(() => {
+    const byAlbumId = new Map();
+    const byExtId = new Map();
+    const byArtistTitle = new Map();
+
+    for (const ua of userAlbums) {
+      if (ua.album_id != null) byAlbumId.set(Number(ua.album_id), ua);
+      if (ua.external_id) byExtId.set(`${ua.source || 'musicbrainz'}:${ua.external_id}`, ua);
+      const norm = normalizeKey(ua.artist, ua.title);
+      if (norm !== ':::') byArtistTitle.set(norm, ua);
+    }
+
+    return { byAlbumId, byExtId, byArtistTitle };
+  }, [userAlbums]);
+
+  const findExistingUserAlbum = useCallback(
+    (album) => {
+      if (!album) return null;
+      if (album.album_id != null && userAlbumLookup.byAlbumId.has(Number(album.album_id))) {
+        return userAlbumLookup.byAlbumId.get(Number(album.album_id));
+      }
+      if (album.external_id) {
+        const extKey = `${album.source || 'musicbrainz'}:${album.external_id}`;
+        if (userAlbumLookup.byExtId.has(extKey)) {
+          return userAlbumLookup.byExtId.get(extKey);
+        }
+      }
+      const norm = normalizeKey(album.artist, album.title);
+      return userAlbumLookup.byArtistTitle.get(norm) || null;
+    },
+    [userAlbumLookup]
+  );
 
   const executeSearch = useCallback(async (q, type, targetPage) => {
     const clean = q.trim();
@@ -141,18 +189,44 @@ export default function Search() {
 
   const handleAlbumAction = async (action) => {
     if (!selectedAlbum) return;
-    const cached = await api.addAlbum({
-      external_id: selectedAlbum.external_id || selectedAlbum.id?.toString(),
-      source: selectedAlbum.source || 'musicbrainz',
-      title: selectedAlbum.title,
-      artist: selectedAlbum.artist,
-      year: selectedAlbum.year,
-      cover_url: selectedAlbum.cover_url,
-    });
+    const existingUa = findExistingUserAlbum(selectedAlbum);
 
     if (action.type === 'recommend') {
-      await api.recommendAlbum({ album_id: cached.id, friend_id: action.friend_id });
+      const targetAlbumId =
+        existingUa?.album_id ||
+        (
+          await api.addAlbum({
+            external_id: selectedAlbum.external_id || selectedAlbum.id?.toString(),
+            source: selectedAlbum.source || 'musicbrainz',
+            title: selectedAlbum.title,
+            artist: selectedAlbum.artist,
+            year: selectedAlbum.year,
+            cover_url: selectedAlbum.cover_url,
+          })
+        ).id;
+
+      await api.recommendAlbum({ album_id: targetAlbumId, friend_id: action.friend_id });
+      return;
+    }
+
+    if (existingUa?.user_album_id || existingUa?.id) {
+      const uaId = existingUa.user_album_id || existingUa.id;
+      await api.updateUserAlbum(uaId, {
+        status: action.status,
+        rating: action.rating,
+        note: action.note,
+        tracks: action.tracks,
+      });
     } else {
+      const cached = await api.addAlbum({
+        external_id: selectedAlbum.external_id || selectedAlbum.id?.toString(),
+        source: selectedAlbum.source || 'musicbrainz',
+        title: selectedAlbum.title,
+        artist: selectedAlbum.artist,
+        year: selectedAlbum.year,
+        cover_url: selectedAlbum.cover_url,
+      });
+
       await api.addUserAlbum({
         album_id: cached.id,
         status: action.status,
@@ -161,7 +235,18 @@ export default function Search() {
         tracks: action.tracks,
       });
     }
+
+    refreshLibrary();
   };
+
+  const handleDeleteUserAlbum = async (targetUserAlbum) => {
+    const uaId = targetUserAlbum?.user_album_id || targetUserAlbum?.id;
+    if (!uaId) return;
+    await api.deleteUserAlbum(uaId);
+    refreshLibrary();
+  };
+
+  const selectedUserAlbum = selectedAlbum ? findExistingUserAlbum(selectedAlbum) : null;
 
   return (
     <div className="p-4 space-y-4">
@@ -270,13 +355,35 @@ export default function Search() {
 
                 {/* Cuadrícula */}
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                  {results.map((album, i) => (
-                    <AlbumCard
-                      key={`${album.external_id || i}-${page}-${i}`}
-                      album={album}
-                      onClick={() => setSelectedAlbum(album)}
-                    />
-                  ))}
+                  {results.map((album, i) => {
+                    const matchedUa = findExistingUserAlbum(album);
+                    return (
+                      <div key={`${album.external_id || i}-${page}-${i}`} className="relative">
+                        <AlbumCard
+                          album={album}
+                          userAlbum={matchedUa}
+                          onClick={() => setSelectedAlbum(album)}
+                        />
+                        {matchedUa?.status && (
+                          <span
+                            className={`absolute top-2 right-2 px-1.5 py-0.5 rounded-md text-[10px] font-bold shadow-xs pointer-events-none ${
+                              matchedUa.status === 'listened'
+                                ? 'bg-primary text-white'
+                                : matchedUa.status === 'partially_listened'
+                                ? 'bg-amber-500 text-black'
+                                : 'bg-black/80 text-white'
+                            }`}
+                          >
+                            {matchedUa.status === 'listened'
+                              ? 'Escuchado'
+                              : matchedUa.status === 'partially_listened'
+                              ? 'Parcial'
+                              : 'Pendiente'}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
 
                 {/* Paginación inferior */}
@@ -341,11 +448,17 @@ export default function Search() {
                           {item.title}
                         </p>
                         <p className="text-xs text-muted truncate mt-0.5">{item.artist}</p>
-                        <p className="text-[11px] text-primary font-medium mt-1 flex items-center gap-1">
-                          <span>{item.display_name}</span>
+                        <div className="text-[11px] text-primary font-medium mt-1 flex items-center gap-1.5 min-w-0">
+                          <UserAvatar
+                            src={item.avatar_url}
+                            name={item.display_name}
+                            username={item.username}
+                            className="w-4 h-4 text-[9px]"
+                          />
+                          <span className="truncate">{item.display_name}</span>
                           <span className="text-muted">·</span>
                           {item.status === 'listened' ? (
-                            <span className="flex items-center gap-1">
+                            <span className="flex items-center gap-1 flex-shrink-0">
                               <IconCheck className="w-3 h-3 inline" />
                               <span>Escuchado</span>
                               {item.rating != null && (
@@ -353,20 +466,20 @@ export default function Search() {
                               )}
                             </span>
                           ) : item.status === 'partially_listened' ? (
-                            <span className="flex items-center gap-1 text-amber-400">
+                            <span className="flex items-center gap-1 text-amber-400 flex-shrink-0">
                               <IconMusic className="w-3 h-3 inline" />
-                              <span>Escuchado parcialmente</span>
+                              <span>Parcial</span>
                               {item.rating != null && (
                                 <span className="font-bold">({item.rating}/10)</span>
                               )}
                             </span>
                           ) : (
-                            <span className="flex items-center gap-1">
+                            <span className="flex items-center gap-1 flex-shrink-0">
                               <IconDisc className="w-3 h-3 inline" />
                               <span>Por escuchar</span>
                             </span>
                           )}
-                        </p>
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -393,6 +506,8 @@ export default function Search() {
           onClose={() => setSelectedAlbum(null)}
           friends={friends}
           onAction={handleAlbumAction}
+          onDelete={selectedUserAlbum ? handleDeleteUserAlbum : undefined}
+          userAlbum={selectedUserAlbum}
         />
       )}
     </div>

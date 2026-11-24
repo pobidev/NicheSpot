@@ -13,6 +13,9 @@ const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+export const MAX_FAVORITE_ALBUMS = 10;
+export const MAX_FAVORITE_TRACKS = 10;
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,6 +23,9 @@ db.exec(`
     display_name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
     lastfm_username TEXT,
+    lastfm_last_sync_uts INTEGER DEFAULT 0,
+    lastfm_synced_user TEXT,
+    avatar_url TEXT,
     favorite_albums TEXT DEFAULT '[]',
     created_at TEXT DEFAULT (datetime('now'))
   );
@@ -67,6 +73,55 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now')),
     UNIQUE(user_album_id, track_title)
   );
+
+  CREATE TABLE IF NOT EXISTS favorite_tracks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK(position BETWEEN 1 AND 10),
+    track_title TEXT NOT NULL,
+    artist_name TEXT NOT NULL,
+    album_title TEXT,
+    cover_url TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(user_id, position)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_favorite_tracks_user
+  ON favorite_tracks(user_id, position);
+
+  CREATE TABLE IF NOT EXISTS recommendation_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recommender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    listener_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+    rating INTEGER,
+    note TEXT,
+    seen INTEGER NOT NULL DEFAULT 0 CHECK(seen IN (0, 1)),
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS user_lastfm_tracks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    artist_norm TEXT NOT NULL,
+    album_norm TEXT NOT NULL,
+    track_norm TEXT NOT NULL,
+    track_title TEXT NOT NULL,
+    play_count INTEGER NOT NULL DEFAULT 1,
+    last_played_uts INTEGER DEFAULT 0,
+    UNIQUE(user_id, artist_norm, album_norm, track_norm)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_user_lastfm_tracks_lookup
+  ON user_lastfm_tracks(user_id, artist_norm, album_norm);
+
+  CREATE TABLE IF NOT EXISTS album_tracklists_cache (
+    artist_norm TEXT NOT NULL,
+    album_norm TEXT NOT NULL,
+    tracks_json TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (artist_norm, album_norm)
+  );
 `);
 
 // Safe migration if user_albums already existed with old CHECK constraint on status
@@ -108,6 +163,9 @@ try {
 // Additive column migrations for existing databases
 const columnMigrations = [
   "ALTER TABLE users ADD COLUMN favorite_albums TEXT DEFAULT '[]'",
+  'ALTER TABLE users ADD COLUMN lastfm_last_sync_uts INTEGER DEFAULT 0',
+  'ALTER TABLE users ADD COLUMN lastfm_synced_user TEXT',
+  'ALTER TABLE users ADD COLUMN avatar_url TEXT',
   'ALTER TABLE user_albums ADD COLUMN pending_recommendation INTEGER NOT NULL DEFAULT 0',
 ];
 
@@ -146,7 +204,14 @@ export function resolveFavoriteAlbums(userId) {
   }
   if (!Array.isArray(ids) || ids.length === 0) return [];
 
-  const placeholders = ids.map(() => '?').join(',');
+  const limitedIds = ids
+    .map(Number)
+    .filter((n) => Number.isInteger(n) && n > 0)
+    .slice(0, MAX_FAVORITE_ALBUMS);
+
+  if (limitedIds.length === 0) return [];
+
+  const placeholders = limitedIds.map(() => '?').join(',');
   const albums = db
     .prepare(
       `SELECT a.*
@@ -157,10 +222,10 @@ export function resolveFavoriteAlbums(userId) {
          AND COALESCE(ua.pending_recommendation, 0) = 0
          AND a.id IN (${placeholders})`
     )
-    .all(userId, ...ids);
+    .all(userId, ...limitedIds);
 
   const byId = new Map(albums.map((a) => [Number(a.id), a]));
-  return ids.map((id) => byId.get(Number(id))).filter(Boolean);
+  return limitedIds.map((id) => byId.get(Number(id))).filter(Boolean);
 }
 
 export function removeAlbumFromFavorites(userId, albumId) {
@@ -181,7 +246,58 @@ export function removeAlbumFromFavorites(userId, albumId) {
   }
 }
 
+export function resolveFavoriteTracks(userId) {
+  return db
+    .prepare(
+      `SELECT id, position, track_title, artist_name, album_title, cover_url, created_at
+       FROM favorite_tracks
+       WHERE user_id = ?
+       ORDER BY position ASC
+       LIMIT ?`
+    )
+    .all(userId, MAX_FAVORITE_TRACKS);
+}
+
+export function createRecommendationNotification({
+  recommenderId,
+  listenerId,
+  albumId,
+  rating = null,
+  note = null,
+}) {
+  if (!recommenderId || !listenerId || !albumId) return;
+  if (Number(recommenderId) === Number(listenerId)) return;
+
+  const recentDuplicate = db
+    .prepare(
+      `SELECT id
+       FROM recommendation_notifications
+       WHERE recommender_id = ?
+         AND listener_id = ?
+         AND album_id = ?
+         AND COALESCE(seen, 0) = 0
+         AND datetime(created_at) >= datetime('now', '-2 hours')
+       LIMIT 1`
+    )
+    .get(recommenderId, listenerId, albumId);
+
+  if (recentDuplicate) return;
+
+  db.prepare(
+    `INSERT INTO recommendation_notifications (recommender_id, listener_id, album_id, rating, note, seen)
+     VALUES (?, ?, ?, ?, ?, 0)`
+  ).run(
+    recommenderId,
+    listenerId,
+    albumId,
+    rating != null ? Number(rating) : null,
+    note || null
+  );
+}
+
 db.resolveFavoriteAlbums = resolveFavoriteAlbums;
 db.removeAlbumFromFavorites = removeAlbumFromFavorites;
+db.resolveFavoriteTracks = resolveFavoriteTracks;
+db.createRecommendationNotification = createRecommendationNotification;
 
 export default db;
