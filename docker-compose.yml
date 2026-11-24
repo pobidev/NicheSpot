@@ -1,0 +1,16 @@
+services:
+  nichospot:
+    build: .
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - nichospot-data:/app/data
+    environment:
+      - PORT=3000
+      - JWT_SECRET=${JWT_SECRET:-change-me}
+      - LASTFM_API_KEY=${LASTFM_API_KEY:-}
+      - DB_PATH=/app/data/nichospot.db
+    restart: unless-stopped
+
+volumes:
+  nichospot-data:
